@@ -17,7 +17,9 @@ def create_diffusion(
     rescale_learned_sigmas=False,
     diffusion_steps=1000
 ):
+    # hyperparameter that control the noise attch to the image 
     betas = gd.get_named_beta_schedule(noise_schedule, diffusion_steps)
+    # choose the loss type 
     if use_kl:
         loss_type = gd.LossType.RESCALED_KL
     elif rescale_learned_sigmas:

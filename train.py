@@ -138,7 +138,7 @@ def main(args):
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.image_size // 8
+    latent_size = args.image_size // 8  #todo downsample,we may can change 8 to another number
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes
