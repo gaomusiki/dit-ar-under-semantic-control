@@ -14,6 +14,7 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.layers import Attention as TimmAttention
 
 
 def modulate(x, shift, scale):
@@ -114,7 +115,7 @@ class DiTBlock(nn.Module):
             **block_kwargs
         )
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-
+        
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -126,7 +127,12 @@ class DiTBlock(nn.Module):
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        #self-attn
+        #x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        #causal-attn   todo
+        causal_mask = torch.tril(torch.ones((x.shape[1], x.shape[1]), device=x.device)).unsqueeze(0).unsqueeze(0)
+        x=x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa),attn_mask=causal_mask)
+
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -180,6 +186,7 @@ class DiT(nn.Module):
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
+        #todo change num_patches to max_len
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
@@ -256,6 +263,47 @@ class DiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
     
+     
+    def clear_eos(self, tokens: torch.Tensor, num_patches: int) -> torch.Tensor:
+        """
+        截取每个样本中：
+        - 第一个 EOS 之前的 num_patches 个 token（不含 EOS 本身）
+        - 若不足，前面补零
+        返回 shape: (B, num_patches, D)
+        """
+        B, T, D = tokens.shape
+        eos_embed = F.normalize(self.eos_token_embed, dim=-1)  # (1, D)
+        output = torch.zeros(B, num_patches, D, device=tokens.device)
+
+        for i in range(B):
+            token_seq = tokens[i]  # (T, D)
+            token_seq_norm = F.normalize(token_seq, dim=-1)
+            sim = F.cosine_similarity(token_seq_norm, eos_embed.expand_as(token_seq_norm), dim=-1)  # (T,)
+
+            # 找到第一个 EOS 的位置
+            eos_idx = (sim > self.eos_threshold).nonzero(as_tuple=False)
+            if eos_idx.numel() > 0:
+                eos_pos = eos_idx[0].item()
+            else:
+                eos_pos = T  # 没有 EOS，就取最后一段
+
+            # 从 eos_pos 往前取 num_patches 个 token
+            start = max(0, eos_pos - num_patches)
+            valid_tokens = token_seq[start:eos_pos]  # (<=num_patches, D)
+
+            # 前面不足就补零
+            pad_len = num_patches - valid_tokens.shape[0]
+            if pad_len > 0:
+                padded = torch.cat([
+                    torch.zeros(pad_len, D, device=tokens.device),
+                    valid_tokens
+                ], dim=0)
+            else:
+                padded = valid_tokens  # 正好或截断
+
+            output[i] = padded  # (num_patches, D)
+
+        return output  # shape: (B, num_patches, D)
 
     ###todo 
     def autoregressive_forward(self, x, t, y, eos_threshold=0.99, max_gen_len=1024):
@@ -289,7 +337,8 @@ class DiT(nn.Module):
         # 3. Positional embedding
         pos_embed = self.pos_embed  # (1, T_max, D)
         finished = torch.zeros(B, dtype=torch.bool, device=device)
-
+        placeholder = torch.zeros(B, 1, patch_dim, device=device)
+        tokens = torch.cat([tokens, placeholder], dim=1)  # Now shape (B, T_noise+1, D)
         for step in range(max_gen_len):
             T_cur = tokens.shape[1]
             pos = pos_embed[:, :T_cur, :]  # (1, T_cur, D)
@@ -322,9 +371,9 @@ class DiT(nn.Module):
 
             if finished.all():
                 break
-
+        output_tokens = self.clear_eos(tokens,self.x_embedder.num_patches)
         # Decode final token sequence to image
-        x_img = self.unpatchify(tokens)  # (B, C, H, W)
+        x_img = self.unpatchify(output_tokens)  # (B, C, H, W)
         return x_img
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
